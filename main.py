@@ -29,7 +29,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-# Avoid verbose HTTP request logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("pinterest_downloader")
@@ -48,14 +47,12 @@ def get_pinterest_url(text: str) -> str | None:
     match = URL_RE.search(text or "")
     if not match:
         return None
-
     url = match.group(0).rstrip(".,!?;:)]}'\"")
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
     except ValueError:
         return None
-
     if parsed.scheme not in {"http", "https"} or host not in ALLOWED_HOSTS:
         return None
     return url
@@ -75,10 +72,11 @@ def _download_with_ytdlp(url: str, output_dir: str) -> tuple[list[str], dict]:
         "restrictfilenames": True,
         "windowsfilenames": True,
         "socket_timeout": 20,
-        "retries": 2,
-        "fragment_retries": 2,
+        "retries": 3,
+        "fragment_retries": 3,
         "max_filesize": MAX_FILE_SIZE,
-        "format": "best[ext=mp4]/best",
+        # هم ویدیو و هم عکس را پشتیبانی می‌کند
+        "format": "bestvideo*+bestaudio/best",
         "merge_output_format": "mp4",
     }
 
@@ -90,12 +88,19 @@ def _download_with_ytdlp(url: str, output_dir: str) -> tuple[list[str], dict]:
         if path.is_file() and path.suffix.lower() not in {".part", ".ytdl", ".json"}:
             files.append(str(path))
 
-    # Some extractors may expose entries; use metadata only for the caption.
     if isinstance(info, dict) and info.get("entries"):
         entries = [entry for entry in info["entries"] if entry]
-        title = entries[0].get("title", "Pinterest media") if entries else "Pinterest media"
+        title = (
+            entries[0].get("title", "Pinterest media")
+            if entries
+            else "Pinterest media"
+        )
     else:
-        title = info.get("title", "Pinterest media") if isinstance(info, dict) else "Pinterest media"
+        title = (
+            info.get("title", "Pinterest media")
+            if isinstance(info, dict)
+            else "Pinterest media"
+        )
 
     return files, {"title": title}
 
@@ -136,7 +141,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    status = await message.reply_text("🔎 دارم لینک را بررسی و رسانهٔ قابل‌دانلود را دریافت می‌کنم…")
+    status = await message.reply_text(
+        "🔎 دارم لینک را بررسی و رسانهٔ قابل‌دانلود را دریافت می‌کنم…"
+    )
     chat_id = update.effective_chat.id
 
     try:
@@ -149,23 +156,30 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     timeout=DOWNLOAD_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
-                await status.edit_text("⏱️ دانلود بیش از حد طول کشید. لطفاً دوباره امتحان کن.")
+                await status.edit_text(
+                    "⏱️ دانلود بیش از حد طول کشید. لطفاً دوباره امتحان کن."
+                )
                 return
             except yt_dlp.utils.DownloadError as exc:
-                logger.info("yt-dlp download failed (%s)", type(exc).__name__)
+                logger.info("yt-dlp download failed (%s): %s", type(exc).__name__, exc)
                 await status.edit_text(
-                    "❌ نتوانستم این پین را دانلود کنم. ممکن است لینک خصوصی، حذف‌شده یا "
-                    "توسط yt-dlp پشتیبانی‌نشده باشد. yt-dlp را هم به‌روز کن و دوباره امتحان کن."
+                    "❌ نتوانستم این پین را دانلود کنم.\n"
+                    "ممکن است لینک خصوصی، حذف‌شده، فقط عکس بدون فرمت پشتیبانی‌شده، "
+                    "یا توسط yt-dlp پشتیبانی‌نشده باشد.\n"
+                    "yt-dlp را به‌روز کن و دوباره امتحان کن."
                 )
                 return
             except Exception as exc:
                 logger.exception("Unexpected download error: %s", type(exc).__name__)
-                await status.edit_text("❌ هنگام دریافت رسانه خطایی رخ داد. بعداً دوباره امتحان کن.")
+                await status.edit_text(
+                    "❌ هنگام دریافت رسانه خطایی رخ داد. بعداً دوباره امتحان کن."
+                )
                 return
 
             if not files:
                 await status.edit_text(
-                    "برای این لینک فایل رسانه‌ای پیدا نکردم. ممکن است این نوع پین پشتیبانی نشود."
+                    "برای این لینک فایل رسانه‌ای پیدا نکردم. "
+                    "ممکن است این نوع پین پشتیبانی نشود."
                 )
                 return
 
@@ -178,17 +192,22 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 size = path.stat().st_size
                 if size == 0:
                     continue
+
                 if size > MAX_FILE_SIZE:
                     await message.reply_text(
-                        f"⚠️ فایل «{path.name}» از سقف {MAX_FILE_SIZE_MB} مگابایت بزرگ‌تر است و ارسال نشد."
+                        f"⚠️ فایل «{path.name}» از سقف {MAX_FILE_SIZE_MB} مگابایت "
+                        "بزرگ‌تر است و ارسال نشد."
                     )
                     continue
 
                 caption = (metadata.get("title") or "Pinterest media")[:900]
-                await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT)
 
-                # Send as video when the extension indicates a common video format.
-                if path.suffix.lower() in {".mp4", ".m4v", ".mov", ".webm"}:
+                await context.bot.send_chat_action(
+                    chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
+                )
+
+                suffix = path.suffix.lower()
+                if suffix in {".mp4", ".m4v", ".mov", ".webm"}:
                     with path.open("rb") as media:
                         await message.reply_video(
                             video=media,
@@ -198,9 +217,8 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                             write_timeout=60,
                             connect_timeout=30,
                         )
-                elif path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"}:
+                elif suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
                     with path.open("rb") as media:
-                        # Telegram photos have stricter constraints; document is more reliable.
                         await message.reply_document(
                             document=media,
                             filename=path.name,
@@ -219,30 +237,40 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                             write_timeout=60,
                             connect_timeout=30,
                         )
+
                 sent_count += 1
 
             if sent_count:
                 await status.delete()
             else:
-                await status.edit_text("فایل قابل‌ارسالی پیدا نشد یا همهٔ فایل‌ها از سقف حجم بزرگ‌تر بودند.")
+                await status.edit_text(
+                    "فایل قابل‌ارسالی پیدا نشد یا همهٔ فایل‌ها از سقف حجم بزرگ‌تر بودند."
+                )
 
     except Exception as exc:
         logger.exception("Handler error: %s", type(exc).__name__)
         try:
-            await status.edit_text("❌ خطای غیرمنتظره‌ای رخ داد. لطفاً بعداً دوباره امتحان کن.")
+            await status.edit_text(
+                "❌ خطای غیرمنتظره‌ای رخ داد. لطفاً بعداً دوباره امتحان کن."
+            )
         except Exception:
             pass
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("دستور ناشناخته است. برای راهنما /help را بزن.")
+    await update.effective_message.reply_text(
+        "دستور ناشناخته است. برای راهنما /help را بزن."
+    )
 
 
 def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing. Set it in your .env or environment variables.")
+        raise RuntimeError(
+            "BOT_TOKEN is missing. Set it in your .env or environment variables."
+        )
 
     app = Application.builder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_link))
