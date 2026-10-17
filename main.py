@@ -51,29 +51,23 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# جلوگیری از چاپ توکن ربات توی لاگ (httpx آدرس کامل درخواست را لاگ می‌کند)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 logger.info("yt-dlp version: %s", YTDLP_VERSION)
 
-# سقف ارسال ویدئو/GIF با Bot API معمولی
 MAX_FILE_SIZE = 49 * 1024 * 1024
-# سقف عکس (بیشتر از این به‌صورت فایل فرستاده می‌شود)
 MAX_PHOTO_SIZE = 10 * 1024 * 1024
 
-# حداکثر تعداد دانلود همزمان (سرور رایگان منابع کمی دارد)
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "2"))
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT)
 
-# فاصله‌ی حداقل بین دو درخواست یک کاربر (ثانیه)
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "10"))
 _last_request: dict[int, float] = {}
 
-# درخواست‌های منتظر انتخاب کیفیت: token -> اطلاعات
 PENDING: dict[str, dict] = {}
-PENDING_TTL = 30 * 60  # ۳۰ دقیقه
+PENDING_TTL = 30 * 60
 
 NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
@@ -85,7 +79,7 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-# متن دکمه استارت (در یک جا تعریف شده تا همه‌جا یکسان باشد)
+# ⚠️ متن دکمه استارت — همه‌جا از همین استفاده می‌شود
 START_BUTTON_TEXT = "🚀 استارت"
 
 
@@ -163,7 +157,6 @@ def is_short_link(url: str) -> bool:
 
 
 def parse_pin_id(url: str):
-    """شناسه‌ی پین را از لینک پینترست برمی‌گرداند؛ در غیر این صورت None."""
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
@@ -176,7 +169,6 @@ def parse_pin_id(url: str):
 
 
 async def resolve_short_link(url: str):
-    """لینک کوتاه pin.it را باز می‌کند و آدرس نهایی را برمی‌گرداند."""
     try:
         async with httpx.AsyncClient(
             timeout=20, follow_redirects=True, headers=BROWSER_HEADERS
@@ -191,8 +183,6 @@ async def resolve_short_link(url: str):
 # ---------------- Pin page (Open Graph) ----------------
 
 class MetaParser(HTMLParser):
-    """تگ‌های <meta property/name=... content=...> را جمع می‌کند."""
-
     def __init__(self):
         super().__init__()
         self.meta: dict[str, str] = {}
@@ -231,7 +221,6 @@ async def fetch_pin_meta(pin_url: str) -> dict:
 
 
 def to_original_url(image_url: str) -> str:
-    """آدرس نسخه‌ی کم‌حجم پینترست را به نسخه‌ی اصلی (originals) تبدیل می‌کند."""
     return re.sub(r"(i\.pinimg\.com)/\d+x/", r"\1/originals/", image_url, count=1)
 
 
@@ -253,7 +242,6 @@ def build_caption(meta: dict, pin_url: str) -> str:
 # ---------------- Image sending ----------------
 
 async def download_bytes(url: str, max_bytes: int):
-    """فایل را در حافظه دانلود می‌کند. خروجی: bytes یا None."""
     try:
         async with httpx.AsyncClient(
             timeout=60, follow_redirects=True, headers=BROWSER_HEADERS
@@ -276,7 +264,6 @@ async def download_bytes(url: str, max_bytes: int):
 
 
 async def send_image(context, chat_id: int, image_url: str, caption: str) -> bool:
-    """عکس/GIF را با بهترین کیفیت (originals) و در صورت نبود، نسخه‌ی معمولی می‌فرستد."""
     candidates = []
     original = to_original_url(image_url)
     if original != image_url:
@@ -345,10 +332,6 @@ def estimate_size(fmt: dict, duration):
 
 
 def build_quality_options(info: dict) -> dict:
-    """گزینه‌های کیفیت قابل ارسال (فایل ویدئویی مستقیم، بدون ffmpeg) را می‌سازد.
-
-    خروجی: {format_id: {"height": int, "size": int|None, ...}}
-    """
     entries = info.get("entries")
     if entries:
         entries = [e for e in entries if e]
@@ -399,7 +382,6 @@ def human_size(size):
 
 
 async def get_video_options(url: str):
-    """اگر پین ویدئو باشد (info, options) برمی‌گرداند؛ در غیر این صورت None."""
     try:
         with TemporaryDirectory() as tmpdir:
             opts = base_opts(tmpdir)
@@ -422,7 +404,6 @@ async def get_video_options(url: str):
 # ---------------- Mandatory Join (Central Admin API) ----------------
 
 async def check_membership(user_id: int):
-    """خروجی: (اجازه دسترسی, کانال‌های باقی‌مانده برای عضویت)."""
     if not API_KEY:
         logger.error("API_KEY is not configured; mandatory join check is blocked")
         return False, []
@@ -437,7 +418,6 @@ async def check_membership(user_id: int):
             response.raise_for_status()
             data = response.json()
 
-        # اگر عضویت اجباری در پنل خاموش باشد، همه مجازند.
         if data.get("enabled") is False:
             return True, []
 
@@ -446,7 +426,6 @@ async def check_membership(user_id: int):
         return allowed, missing
     except Exception:
         logger.exception("Central membership API request failed")
-        # در صورت خرابی API دسترسی را باز نمی‌کنیم.
         return False, []
 
 
@@ -461,7 +440,6 @@ def _channel_value(channel, *keys):
 
 
 async def membership_markup(missing):
-    """دکمه‌های عضویت را از اطلاعات کانال‌های برگشتی API می‌سازد."""
     rows = []
     channels = missing if all(isinstance(item, dict) for item in missing) else []
     if missing and not channels:
@@ -538,6 +516,7 @@ async def start(
 ):
     if not await require_membership(update, context):
         return
+    # ⚠️ کیبورد پایین همیشه همراه پیام استارت ارسال می‌شود
     await update.effective_message.reply_text(
         "سلام 👋\n\n"
         "لینک یک پین پینترست (pinterest.com/pin/... یا pin.it/...) را بفرست.\n"
@@ -583,7 +562,6 @@ async def handle_url(
         )
         return
 
-    # محدودیت فاصله‌ی زمانی برای هر کاربر
     user_id = update.effective_user.id if update.effective_user else 0
     now = time.monotonic()
     last = _last_request.get(user_id, 0)
@@ -614,7 +592,6 @@ async def handle_url(
         meta = await fetch_pin_meta(pin_url)
         caption = build_caption(meta, pin_url)
 
-        # ۱) اگر پین ویدئو است: دکمه‌ی انتخاب کیفیت
         video = await get_video_options(pin_url)
         if video:
             info, options = video
@@ -642,7 +619,6 @@ async def handle_url(
             await status.edit_text("🎬 کیفیت را انتخاب کن:", reply_markup=markup)
             return
 
-        # ۲) عکس یا GIF
         image_url = meta.get("og:image") or meta.get("twitter:image")
         if image_url:
             await status.edit_text("📤 در حال ارسال...")
@@ -770,7 +746,6 @@ async def on_quality(
 
 
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
-    # خطاهای شبکه‌ی گذرا (مثل Conflict هنگام دیپلوی) را فقط کوتاه لاگ می‌کنیم
     logger.warning("Bot error: %s", context.error)
 
 
@@ -797,10 +772,12 @@ def main():
     app.add_handler(CallbackQueryHandler(on_join_check, pattern=r"^join:check$"))
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q:"))
 
-    # هندلر دکمه استارت از کیبورد پایین (قبل از handle_url)
+    # ⚠️ هندلر دکمه استارت از کیبورد پایین — دقیقاً قبل از handle_url
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.Regex(r"^🚀 استارت$"),
+            filters.TEXT & ~filters.COMMAND & filters.Regex(
+                rf"^{re.escape(START_BUTTON_TEXT)}$"
+            ),
             handle_reply_keyboard,
         )
     )
