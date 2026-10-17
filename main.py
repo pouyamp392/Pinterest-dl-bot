@@ -17,6 +17,11 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeAllPrivateChats,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
 from telegram.ext import (
     Application,
@@ -33,6 +38,10 @@ from yt_dlp.version import __version__ as YTDLP_VERSION
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# تنظیمات عضویت اجباری از طریق ربات ادمین مرکزی
+ADMIN_API_URL = os.getenv("ADMIN_API_URL", "https://admin-dl-bot.onrender.com").rstrip("/")
+API_KEY = os.getenv("API_KEY", "")
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN not found")
@@ -76,6 +85,9 @@ BROWSER_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# متن دکمه استارت (در یک جا تعریف شده تا همه‌جا یکسان باشد)
+START_BUTTON_TEXT = "🚀 استارت"
+
 
 # ---------------- Health Server ----------------
 
@@ -95,6 +107,40 @@ def start_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     logger.info("Health server started on port %s", port)
     server.serve_forever()
+
+
+# ---------------- Bot Commands (منوی آبی کنار کیبورد) ----------------
+
+async def setup_bot_commands(app: Application):
+    commands = [
+        BotCommand("start", START_BUTTON_TEXT),
+    ]
+
+    await app.bot.set_my_commands(
+        commands,
+        scope=BotCommandScopeDefault(),
+    )
+
+    await app.bot.set_my_commands(
+        commands,
+        scope=BotCommandScopeAllPrivateChats(),
+    )
+
+    logger.info("Bot commands configured.")
+
+
+# ---------------- Reply Keyboard (کیبورد پایین) ----------------
+
+def get_main_reply_keyboard() -> ReplyKeyboardMarkup:
+    keyboard = [
+        [KeyboardButton(START_BUTTON_TEXT)],
+    ]
+    return ReplyKeyboardMarkup(
+        keyboard,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="لینک پین‌ترست را بفرست یا استارت بزن...",
+    )
 
 
 # ---------------- URL helpers ----------------
@@ -373,19 +419,147 @@ async def get_video_options(url: str):
     return None
 
 
+# ---------------- Mandatory Join (Central Admin API) ----------------
+
+async def check_membership(user_id: int):
+    """خروجی: (اجازه دسترسی, کانال‌های باقی‌مانده برای عضویت)."""
+    if not API_KEY:
+        logger.error("API_KEY is not configured; mandatory join check is blocked")
+        return False, []
+
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+            response = await client.get(
+                f"{ADMIN_API_URL}/api/check",
+                params={"user_id": user_id},
+                headers={"X-API-Key": API_KEY},
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        # اگر عضویت اجباری در پنل خاموش باشد، همه مجازند.
+        if data.get("enabled") is False:
+            return True, []
+
+        missing = data.get("missing") or []
+        allowed = bool(data.get("ok")) and not missing
+        return allowed, missing
+    except Exception:
+        logger.exception("Central membership API request failed")
+        # در صورت خرابی API دسترسی را باز نمی‌کنیم.
+        return False, []
+
+
+def _channel_value(channel, *keys):
+    if isinstance(channel, dict):
+        for key in keys:
+            value = channel.get(key)
+            if value:
+                return str(value)
+        return ""
+    return str(channel) if channel else ""
+
+
+async def membership_markup(missing):
+    """دکمه‌های عضویت را از اطلاعات کانال‌های برگشتی API می‌سازد."""
+    rows = []
+    channels = missing if all(isinstance(item, dict) for item in missing) else []
+    if missing and not channels:
+        try:
+            async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+                response = await client.get(
+                    f"{ADMIN_API_URL}/api/channels",
+                    headers={"X-API-Key": API_KEY},
+                )
+                response.raise_for_status()
+                payload = response.json()
+            all_channels = payload.get("channels", payload) if isinstance(payload, dict) else payload
+            if isinstance(all_channels, list):
+                wanted = {str(item).lstrip("@").lower() for item in missing}
+                for channel in all_channels:
+                    if not isinstance(channel, dict):
+                        continue
+                    identifiers = {
+                        _channel_value(channel, "id", "channel_id", "username", "channel", "chat_id").lstrip("@").lower(),
+                        _channel_value(channel, "username", "channel", "chat_id").lstrip("@").lower(),
+                    }
+                    if wanted.intersection(identifiers):
+                        channels.append(channel)
+        except Exception:
+            logger.exception("Could not load channel buttons from central API")
+
+    for channel in channels:
+        url = _channel_value(channel, "join_url", "url", "invite_link", "channel_url", "link")
+        name = _channel_value(channel, "title", "name", "username", "channel") or "عضویت در کانال"
+        if url.startswith("http://") or url.startswith("https://"):
+            rows.append([InlineKeyboardButton(f"عضویت در {name}", url=url)])
+
+    rows.append([InlineKeyboardButton("✅ عضو شدم؛ بررسی دوباره", callback_data="join:check")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def require_membership(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return False
+
+    allowed, missing = await check_membership(user.id)
+    if allowed:
+        return True
+
+    await message.reply_text(
+        "🔒 برای استفاده از ربات، ابتدا در کانال‌های زیر عضو شو؛ سپس روی «عضو شدم» بزن.",
+        reply_markup=await membership_markup(missing),
+    )
+    return False
+
+
+async def on_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    allowed, missing = await check_membership(query.from_user.id)
+    if allowed:
+        await query.edit_message_text(
+            "✅ عضویتت تأیید شد. حالا لینک پینترست را برای ربات بفرست."
+        )
+    else:
+        await query.edit_message_text(
+            "❌ هنوز عضویتت تأیید نشده. در کانال‌های لازم عضو شو و دوباره بررسی کن.",
+            reply_markup=await membership_markup(missing),
+        )
+
+
 # ---------------- Bot Commands ----------------
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    if not await require_membership(update, context):
+        return
     await update.effective_message.reply_text(
         "سلام 👋\n\n"
         "لینک یک پین پینترست (pinterest.com/pin/... یا pin.it/...) را بفرست.\n"
         "اگر عکس یا GIF باشد با بهترین کیفیت می‌فرستمش، و اگر ویدئو باشد "
         "می‌توانی کیفیت را انتخاب کنی. 📌\n\n"
-        "فقط محتوایی را دانلود کن که مال خودت است یا اجازه‌اش را داری."
+        "فقط محتوایی را دانلود کن که مال خودت است یا اجازه‌اش را داری.",
+        reply_markup=get_main_reply_keyboard(),
     )
+
+
+# ---------------- هندلر دکمه استارت از کیبورد پایین ----------------
+
+async def handle_reply_keyboard(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.effective_message
+    if not message or not message.text:
+        return
+
+    if message.text.strip() == START_BUTTON_TEXT:
+        await start(update, context)
 
 
 async def handle_url(
@@ -395,6 +569,9 @@ async def handle_url(
     message = update.effective_message
 
     if not message or not message.text:
+        return
+
+    if not await require_membership(update, context):
         return
 
     raw_url = extract_url(message.text)
@@ -491,6 +668,15 @@ async def on_quality(
 ):
     query = update.callback_query
     data = query.data or ""
+
+    allowed, missing = await check_membership(query.from_user.id)
+    if not allowed:
+        await query.answer("ابتدا باید در کانال‌های لازم عضو شوی.", show_alert=True)
+        await query.message.reply_text(
+            "🔒 برای ادامه، ابتدا عضو کانال‌های زیر شو و عضویتت را بررسی کن.",
+            reply_markup=await membership_markup(missing),
+        )
+        return
 
     try:
         _, token, fid = data.split(":", 2)
@@ -590,22 +776,42 @@ async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- Main ----------------
 
+async def post_init(app: Application):
+    await setup_bot_commands(app)
+
+
 def main():
     threading.Thread(
         target=start_health_server,
         daemon=True,
     ).start()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(on_join_check, pattern=r"^join:check$"))
     app.add_handler(CallbackQueryHandler(on_quality, pattern=r"^q:"))
+
+    # هندلر دکمه استارت از کیبورد پایین (قبل از handle_url)
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND & filters.Regex(r"^🚀 استارت$"),
+            handle_reply_keyboard,
+        )
+    )
+
     app.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             handle_url,
         )
     )
+
     app.add_error_handler(on_error)
 
     logger.info("Pinterest bot is starting...")
